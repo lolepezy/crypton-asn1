@@ -20,7 +20,9 @@ extra-doc-files:
 - README.md
 
 language: Haskell98
-other-extensions: CPP
+other-extensions:
+- BangPatterns
+- CPP
 
 library:
   source-dirs: src
