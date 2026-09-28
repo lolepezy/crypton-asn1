@@ -35,8 +35,52 @@ import           Data.ASN1.Types
                    ( ASN1 (..), ASN1ConstructionType (..), ASN1Object (..) )
 import           Data.ASN1.Stream ( getConstructedEnd )
 
+-- | The ASN.1 items a parser works on.
+--
+-- A parser run on the items of a construction ('onNextContainer') reads them
+-- from the list they are in, up to the 'End' that closes the construction,
+-- rather than from a copy of them. Which items are visible is exactly what
+-- 'getConstructedEnd' would give.
+data Stream
+  = Items [ASN1]
+    -- ^ All of a list.
+  | Within !Int [ASN1]
+    -- ^ A list up to the 'End' that closes a construction, given the number
+    -- of 'Start' items read since the construction started that are still
+    -- open.
+
+-- | The items left in a stream, as a list.
+items :: Stream -> [ASN1]
+items (Items xs)    = xs
+items (Within d xs) = fst (getConstructedEnd d xs)
+
+-- | The next item in a stream, and the rest of the stream.
+next :: Stream -> Maybe (ASN1, Stream)
+next (Items [])       = Nothing
+next (Items (x : xs)) = Just (x, Items xs)
+next (Within d xs)    = case xs of
+  []         -> Nothing
+  (x : rest) -> case x of
+    Start _        -> Just (x, Within (d + 1) rest)
+    End _
+      | d == 0     -> Nothing
+      | otherwise  -> Just (x, Within (d - 1) rest)
+    _              -> Just (x, Within d rest)
+{-# INLINE next #-}
+
+-- | The list under a stream.
+underlying :: Stream -> [ASN1]
+underlying (Items xs)    = xs
+underlying (Within _ xs) = xs
+
+-- | The stream, with the list under it replaced by what follows a whole
+-- construction in it.
+continueWith :: Stream -> [ASN1] -> Stream
+continueWith (Items _)    xs = Items xs
+continueWith (Within d _) xs = Within d xs
+
 -- | Type representing a parser combinator for a stream of ASN.1 items.
-newtype ParseASN1 a = P { runP :: [ASN1] -> Either String (a, [ASN1]) }
+newtype ParseASN1 a = P { runP :: Stream -> Either String (a, Stream) }
 
 instance Functor ParseASN1 where
   fmap f m = P (fmap (first f) . runP m)
@@ -74,7 +118,10 @@ instance MonadFail ParseASN1 where
 -- | Run the given parse monad over the given list of ASN.1 items. Returns the
 -- result and a list of the ASN.1 items remaining in the stream (if successful).
 runParseASN1State :: ParseASN1 a -> [ASN1] -> Either String (a, [ASN1])
-runParseASN1State = runP
+runParseASN1State f list =
+  case runP f (Items list) of
+    Left err     -> Left err
+    Right (a, s) -> Right (a, items s)
 
 -- | Run the given parse monad over the given list of ASN.1 items and returns
 -- the result (if successful).
@@ -82,10 +129,13 @@ runParseASN1State = runP
 -- If ASN.1 items remain in the stream after doing so, returns an error.
 runParseASN1 :: ParseASN1 a -> [ASN1] -> Either String a
 runParseASN1 f list =
-  case runP f list of
+  case runParseASN1State f list of
     Left err      -> Left err
     Right (result, []) -> Right result
-    Right (_, rest) -> Left ("runParseASN1: remaining state " ++ show rest)
+    Right (_, rest) -> Left (remainingState rest)
+
+remainingState :: [ASN1] -> String
+remainingState rest = "runParseASN1: remaining state " ++ show rest
 
 -- | Throw a parse error.
 throwParseError ::
@@ -94,20 +144,15 @@ throwParseError ::
   -> ParseASN1 a
 throwParseError err = P $ \_ -> Left err
 
--- | Returns a list of ASN.1 items in the stream.
-get :: ParseASN1 [ASN1]
-get = P $ \list -> Right (list, list)
-
--- | Puts the given list of ASN.1 items as the remainder of the stream and
--- returns @()@.
-put :: [ASN1] -> ParseASN1 ()
-put list = P $ \_ -> Right ((), list)
-
 -- | Run the parse monad over the elements of the next container of specified
 -- type. Throws an error if there is no next container of the specified type.
 onNextContainer :: ASN1ConstructionType -> ParseASN1 a -> ParseASN1 a
-onNextContainer ty f =
-  getNextContainer ty >>= either throwParseError pure . runParseASN1 f
+onNextContainer ty f = P $ \s ->
+  case next s of
+    Nothing -> Left "empty"
+    Just (item, s2)
+      | item == Start ty -> inContainer f s (underlying s2)
+      | otherwise        -> Left "not an expected container"
 
 -- | As for 'onNextContainer', except that it does not throw an error if there
 -- is no next container of the specified type.
@@ -115,68 +160,83 @@ onNextContainerMaybe ::
      ASN1ConstructionType
   -> ParseASN1 a
   -> ParseASN1 (Maybe a)
-onNextContainerMaybe ty f =
-  getNextContainerMaybe ty >>= \case
-    Nothing -> pure Nothing
-    Just list -> either throwParseError (pure . Just) $ runParseASN1 f list
+onNextContainerMaybe ty f = P $ \s ->
+  case next s of
+    Just (item, s2)
+      | item == Start ty -> first Just <$> inContainer f s (underlying s2)
+    _ -> Right (Nothing, s)
+
+-- | Run a parser on the items of a construction: those of a list up to the
+-- 'End' that closes the construction, whose 'Start' has been read from the
+-- given stream. All of them must be used. The stream then goes on after the
+-- 'End'.
+inContainer :: ParseASN1 a -> Stream -> [ASN1] -> Either String (a, Stream)
+inContainer f s xs =
+  case runP f (Within 0 xs) of
+    Left err -> Left err
+    Right (a, Within d ys) -> case ys of
+      [] -> Right (a, continueWith s [])
+      (y : rest) -> case y of
+        End _ | d == 0 -> Right (a, continueWith s rest)
+        _              -> Left (remainingState (fst (getConstructedEnd d ys)))
+    -- The parser has turned the items into a list of its own ('getObject').
+    Right (a, Items []) -> Right (a, continueWith s (snd (getConstructedEnd 0 xs)))
+    Right (_, Items rest) -> Left (remainingState rest)
 
 -- | Get the next container of the specified type and return a list of all its
 -- ASN.1 elements. Throws a parse error if there is no next container of the
 -- specified type.
 getNextContainer :: ASN1ConstructionType -> ParseASN1 [ASN1]
-getNextContainer ty =
-  get >>= \case
-    [] -> throwParseError "empty"
-    (item : rest)
-      | item == Start ty -> do
-          let (list, rest') = getConstructedEnd 0 rest
-          put rest' >> pure list
-      | otherwise -> throwParseError "not an expected container"
+getNextContainer ty = P $ \s ->
+  case next s of
+    Nothing -> Left "empty"
+    Just (item, s2)
+      | item == Start ty ->
+          let (list, rest') = getConstructedEnd 0 (underlying s2)
+          in  Right (list, continueWith s rest')
+      | otherwise -> Left "not an expected container"
 
 -- | As for 'getNextContainer', except that it does not throw an error if there
 -- is no next container of the specified type.
 getNextContainerMaybe :: ASN1ConstructionType -> ParseASN1 (Maybe [ASN1])
-getNextContainerMaybe ty =
-  get >>= \case
-    [] -> pure Nothing
-    (item : rest)
-      | item == Start ty -> do
-          let (list, rest') = getConstructedEnd 0 rest
-          put rest' >> pure (Just list)
-      | otherwise -> pure Nothing
+getNextContainerMaybe ty = P $ \s ->
+  case next s of
+    Just (item, s2)
+      | item == Start ty ->
+          let (list, rest') = getConstructedEnd 0 (underlying s2)
+          in  Right (Just list, continueWith s rest')
+    _ -> Right (Nothing, s)
 
 -- | Get the next ASN.1 item in a stream of ASN.1 items.
 getNext :: ParseASN1 ASN1
-getNext =
-  get >>= \case
-    [] -> throwParseError "empty"
-    (item : rest) -> put rest >> pure item
+getNext = P $ \s ->
+  case next s of
+    Nothing        -> Left "empty"
+    Just (item, s2) -> Right (item, s2)
 
 -- | Applies the given function to the next ASN.1 item in a stream of ASN.1
 -- items, if there is one.
 getNextMaybe :: (ASN1 -> Maybe a) -> ParseASN1 (Maybe a)
-getNextMaybe f =
-  get >>= \case
-    [] -> pure Nothing
-    list@(item : rest) -> do
+getNextMaybe f = P $ \s ->
+  case next s of
+    Nothing        -> Right (Nothing, s)
+    Just (item, s2) ->
       let result = f item
-      case result of
-        Nothing -> put list
-        Just _  -> put rest
-      pure result
+      in  case result of
+            Nothing -> Right (result, s)
+            Just _  -> Right (result, s2)
 
 -- | Are there any more ASN.1 items in the stream?
 hasNext :: ParseASN1 Bool
-hasNext = not . null <$> get
+hasNext = P $ \s -> Right (maybe False (const True) (next s), s)
 
 -- | Get the object from the next ASN.1 item in a stream of ASN.1 items.
 -- Throws a parse error if the object cannot be obtained from the item.
 getObject :: ASN1Object a => ParseASN1 a
-getObject = do
-  list <- get
-  case fromASN1 list of
-    Left err -> throwParseError err
-    Right (object, rest) -> put rest >> pure object
+getObject = P $ \s ->
+  case fromASN1 (items s) of
+    Left err             -> Left err
+    Right (object, rest) -> Right (object, Items rest)
 
 -- | Get many items from the stream until there are none left.
 getMany :: ParseASN1 a -> ParseASN1 [a]
