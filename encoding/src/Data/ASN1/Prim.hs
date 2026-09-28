@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ViewPatterns #-}
 
 {- |
@@ -48,7 +49,8 @@ import           Control.Monad ( unless )
 import           Data.ASN1.BitArray ( BitArray (..), toBitArray )
 import           Data.ASN1.Error ( ASN1Error (..) )
 import           Data.ASN1.Internal
-                   ( bytesOfInt, intOfBytes, putVarEncodingIntegral, uintOfBytes
+                   ( bytesOfInteger, intOfBytes, integerOfBytes
+                   , putVarEncodingIntegral, uintOfBytes
                    )
 import           Data.ASN1.Serialize ( putHeader )
 import           Data.ASN1.Stream ( getConstructedEnd )
@@ -62,23 +64,24 @@ import           Data.ASN1.Types.Lowlevel
                    , ASN1Length (..)
                    )
 import           Data.Bits
-                   ( (.&.), (.|.), clearBit, countTrailingZeros, shiftL, shiftR
-                   , testBit
+                   ( (.&.), (.|.), bit, countLeadingZeros, countTrailingZeros
+                   , shiftL, shiftR, testBit
                    )
 import           Data.ByteString ( ByteString )
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as BC
+import qualified Data.ByteString.Internal as B ( unsafeCreate )
 import qualified Data.ByteString.Unsafe as B
 import           Data.Char (ord, isDigit)
 import           Data.Hourglass
-                   ( Date (..), DateTime (..), NanoSeconds (..)
-                   , TimezoneOffset (..), timeParseE, timePrint, timezone_UTC
-                   , todNSec
+                   ( Date (..), DateTime (..), Month (..), NanoSeconds (..)
+                   , TimeOfDay (..), TimezoneOffset (..), timeParseE, timePrint
+                   , timezone_UTC
                    )
-import           Data.List ( unfoldr )
-import qualified Data.List.NonEmpty as NE
 import           Data.Maybe ( isJust )
 import           Data.Word ( Word64, Word8 )
+import           Foreign.Ptr ( Ptr )
+import           Foreign.Storable ( pokeByteOff )
 import           Prelude hiding ( exp, exponent )
 
 encodeHeader :: Bool -> ASN1Length -> ASN1 -> ASN1Header
@@ -239,11 +242,11 @@ getEnumerated s = Enumerated <$> getIntegerRaw "enumerated" s
 getIntegerRaw :: String -> ByteString -> Either ASN1Error Integer
 getIntegerRaw typestr s
   | B.length s == 0 = Left . TypeDecodingFailed $ typestr ++ ": null encoding"
-  | B.length s == 1 = Right $ snd $ intOfBytes s
+  | B.length s == 1 = Right $! integerOfBytes s
   | otherwise =
       if (v1 == 0xff && testBit v2 7) || (v1 == 0x0 && not ( testBit v2 7))
         then Left . TypeDecodingFailed $ typestr ++ ": not shortest encoding"
-        else Right $ snd $ intOfBytes s
+        else Right $! integerOfBytes s
  where
   v1 = s `B.index` 0
   v2 = s `B.index` 1
@@ -325,34 +328,51 @@ getNull s
   | otherwise = Left $ TypeDecodingFailed "Null: data length not within bound"
 
 -- | Return an OID.
+--
+-- The first byte gives the first two components (@x `div` 40@ and
+-- @x `mod` 40@), the other bytes the rest, seven bits per byte, each
+-- component ending with a byte that has its top bit clear. Trailing bytes
+-- that all have their top bit set make one more component.
 getOID :: ByteString -> Either ASN1Error ASN1
-getOID s = case B.unpack s of
-  [] -> Left $ TypeDecodingFailed "OID: no data"
-  (x : xs) -> Right $ OID
-    ( fromIntegral (x `div` 40)
-    : fromIntegral (x `mod` 40)
-    : groupOID xs
-    )
+getOID s
+  | B.null s  = Left $ TypeDecodingFailed "OID: no data"
+  | otherwise =
+      let x = B.unsafeHead s
+          !rest = components 1
+      in  Right $ OID (fromIntegral (x `div` 40) : fromIntegral (x `mod` 40) : rest)
  where
-  groupOID :: [Word8] -> [Integer]
-  groupOID =
-    map (foldl (\acc n -> (acc `shiftL` 7) + fromIntegral n) 0) . groupSubOID
+  n = B.length s
 
-  groupSubOIDHelper [] = Nothing
-  groupSubOIDHelper l  = Just $ spanSubOIDbound l
+  components :: Int -> [Integer]
+  components !i
+    | i >= n    = []
+    | otherwise = small i 0
 
-  groupSubOID :: [Word8] -> [[Word8]]
-  groupSubOID = unfoldr groupSubOIDHelper
-
-  spanSubOIDbound [] = ([], [])
-  spanSubOIDbound (a:as) = if testBit a 7
-    then (clearBit a 7 : ys, zs)
-    else ([a], as)
+  -- A component in a machine word, while one more byte is sure to fit.
+  small :: Int -> Word64 -> [Integer]
+  small !i !acc
+    | i >= n        = [toInteger acc]
+    | acc >= bit 57 = big i (toInteger acc)
+    | testBit b 7   = small (i + 1) acc'
+    | otherwise     = let !c  = toInteger acc'
+                          !cs = components (i + 1)
+                      in  c : cs
    where
-    (ys, zs) = spanSubOIDbound as
+    b = B.unsafeIndex s i
+    acc' = (acc `shiftL` 7) .|. fromIntegral (b .&. 0x7f)
+
+  big :: Int -> Integer -> [Integer]
+  big !i !acc
+    | i >= n      = [acc]
+    | testBit b 7 = big (i + 1) acc'
+    | otherwise   = let !cs = components (i + 1) in acc' : cs
+   where
+    b = B.unsafeIndex s i
+    acc' = (acc `shiftL` 7) + fromIntegral (b .&. 0x7f)
 
 getTime :: ASN1TimeType -> ByteString -> Either ASN1Error ASN1
 getTime timeType bs
+  | Just t <- getCanonicalTime timeType bs = Right t
   | hasNonASCII bs = decodingError "contains non ASCII characters"
   | otherwise =
       case timeParseE format (BC.unpack bs) of -- BC.unpack is safe as we check ASCIIness first
@@ -426,9 +446,45 @@ getTime timeType bs
     ("time format invalid for " ++ show timeType ++ " : " ++ reason)
   hasNonASCII = isJust . B.find (> 0x7f)
 
+-- | The forms of time DER requires, @YYMMDDHHMMSSZ@ for UTCTime and
+-- @YYYYMMDDHHMMSSZ@ for GeneralizedTime, which is what nearly all times are.
+-- Gives what the general parser in 'getTime' gives for them: no value is
+-- checked to be in range, a month is taken modulo 12, and a two-digit year
+-- below 51 is in the 2000s.
+getCanonicalTime :: ASN1TimeType -> ByteString -> Maybe ASN1
+getCanonicalTime timeType bs = case timeType of
+  TimeUTC
+    | B.length bs == 13 && allDigits 12 && B.unsafeIndex bs 12 == 0x5a ->
+        let yy = digits2 0
+            y  = if yy < 70 then yy + 2000 else yy + 1900
+        in  Just $ time (if y > 2050 then y - 100 else y) 2
+  TimeGeneralized
+    | B.length bs == 15 && allDigits 14 && B.unsafeIndex bs 14 == 0x5a ->
+        Just $ time (digits2 0 * 100 + digits2 2) 4
+  _ -> Nothing
+ where
+  digit i = fromIntegral (B.unsafeIndex bs i) - 0x30 :: Int
+  digits2 i = digit i * 10 + digit (i + 1)
+  allDigits k = go 0
+   where
+    go i = i >= k || (let c = B.unsafeIndex bs i in c >= 0x30 && c <= 0x39 && go (i + 1))
+  -- o is where the month starts
+  time y o = ASN1Time timeType
+    ( DateTime
+        (Date y (toEnum ((digits2 o - 1) `mod` 12)) (digits2 (o + 2)))
+        (TimeOfDay
+          (fromIntegral (digits2 (o + 4)))
+          (fromIntegral (digits2 (o + 6)))
+          (fromIntegral (digits2 (o + 8)))
+          0)
+    )
+    (Just timezone_UTC)
+
 -- FIXME need msec printed
 putTime :: ASN1TimeType -> DateTime -> Maybe TimezoneOffset -> ByteString
-putTime ty dt mtz = BC.pack etime
+putTime ty dt mtz
+  | Just b <- putCanonicalTime ty dt mtz = b
+  | otherwise = BC.pack etime
  where
   etime
     | ty == TimeUTC = timePrint "YYMMDDHMIS" dt ++ tzStr
@@ -440,12 +496,61 @@ putTime ty dt mtz = BC.pack etime
       | tz == timezone_UTC -> "Z"
       | otherwise          -> show tz
 
+-- | 'putTime' for a valid date and time (one that exists) in years 1900 to
+-- 9999 (1000 to 9999 for GeneralizedTime), with no timezone or UTC, which is
+-- what nearly all times are. Gives what 'timePrint' gives for them. (That
+-- goes through seconds since the epoch and back, so it would not give the
+-- fields back unchanged for a time that does not exist.)
+putCanonicalTime ::
+     ASN1TimeType
+  -> DateTime
+  -> Maybe TimezoneOffset
+  -> Maybe ByteString
+putCanonicalTime ty (DateTime (Date y m d) (TimeOfDay h mi s ns)) mtz
+  | yearOk && d >= 1 && d <= daysInMonth && h >= 0 && h <= 23
+      && mi >= 0 && mi <= 59 && s >= 0 && s <= 59 && ns >= 0 && ns < 1000000000
+  , Just tzLen <- tzLength =
+      Just $ B.unsafeCreate (yLen + 10 + tzLen) $ \p -> do
+        if ty == TimeUTC
+          then poke2 p 0 ((y - 1900) `mod` 100)
+          else poke2 p 0 (y `div` 100) >> poke2 p 2 (y `mod` 100)
+        poke2 p yLen (fromEnum m + 1)
+        poke2 p (yLen + 2) d
+        poke2 p (yLen + 4) (fromIntegral h)
+        poke2 p (yLen + 6) (fromIntegral mi)
+        poke2 p (yLen + 8) (fromIntegral s)
+        if tzLen == 1 then pokeByteOff p (yLen + 10) (0x5a :: Word8) else pure ()
+  | otherwise = Nothing
+ where
+  (yearOk, yLen)
+    | ty == TimeUTC = (y >= 1900 && y <= 9999, 2)
+    | otherwise     = (y >= 1000 && y <= 9999, 4)
+  tzLength = case mtz of
+    Nothing -> Just 0
+    Just tz
+      | tz == timezone_UTC -> Just 1
+      | otherwise          -> Nothing
+  daysInMonth = case m of
+    February
+      | (y `mod` 4 == 0 && y `mod` 100 /= 0) || y `mod` 400 == 0 -> 29
+      | otherwise -> 28
+    April     -> 30
+    June      -> 30
+    September -> 30
+    November  -> 30
+    _         -> 31
+
+poke2 :: Ptr Word8 -> Int -> Int -> IO ()
+poke2 p off v = do
+  pokeByteOff p off (fromIntegral (0x30 + v `div` 10) :: Word8)
+  pokeByteOff p (off + 1) (fromIntegral (0x30 + v `mod` 10) :: Word8)
+
 putInteger :: Integer -> ByteString
-putInteger i = B.pack $ NE.toList $ bytesOfInt i
+putInteger = bytesOfInteger
 
 putBitString :: BitArray -> ByteString
 putBitString (BitArray n bits) =
-  B.concat [B.singleton (fromIntegral i), bits]
+  B.cons (fromIntegral i) bits
  where
   i = (8 - (n `mod` 8)) .&. 0x7
 
@@ -453,17 +558,50 @@ putString :: ByteString -> ByteString
 putString l = l
 
 {- no enforce check that oid1 is between [0..2] and oid2 is between [0..39] -}
+--
+-- Components after the first two are written seven bits per byte, with the
+-- top bit set on all bytes but the last. @0@ is one zero byte, a negative
+-- component is left out.
 putOID :: [Integer] -> ByteString
 putOID oids = case oids of
   (oid1:oid2:suboids) ->
-    let eoidclass = fromIntegral (oid1 * 40 + oid2)
-        subeoids  = B.concat $ map encode suboids
-    in  B.cons eoidclass subeoids
+    let eoidclass = fromIntegral (oid1 * 40 + oid2) :: Word8
+        len = 1 + sum (map componentLength suboids)
+    in  B.unsafeCreate len $ \p -> do
+          pokeByteOff p 0 eoidclass
+          pokeComponents p 1 suboids
   _ -> error ("invalid OID format " ++ show oids)
  where
-  encode x
-    | x == 0    = B.singleton 0
-    | otherwise = putVarEncodingIntegral x
+  componentLength :: Integer -> Int
+  componentLength x
+    | x == 0    = 1
+    | x < 0     = 0
+    | x <= toInteger (maxBound :: Word64) = groups (fromInteger x)
+    | otherwise = B.length (putVarEncodingIntegral x)
+
+  groups :: Word64 -> Int
+  groups w = (64 - countLeadingZeros w + 6) `div` 7
+
+  pokeComponents :: Ptr Word8 -> Int -> [Integer] -> IO ()
+  pokeComponents _ _ [] = pure ()
+  pokeComponents p !off (x : xs)
+    | x == 0 = pokeByteOff p off (0 :: Word8) >> pokeComponents p (off + 1) xs
+    | x < 0  = pokeComponents p off xs
+    | x <= toInteger (maxBound :: Word64) = do
+        let w = fromInteger x :: Word64
+            k = groups w
+            go j
+              | j >= k    = pure ()
+              | otherwise = do
+                  let g = fromIntegral ((w `shiftR` (7 * (k - 1 - j))) .&. 0x7f) :: Word8
+                  pokeByteOff p (off + j) (if j < k - 1 then g .|. 0x80 else g)
+                  go (j + 1)
+        go 0
+        pokeComponents p (off + k) xs
+    | otherwise = do
+        let bs = putVarEncodingIntegral x
+        mapM_ (\(j, c) -> pokeByteOff p (off + j) c) (zip [0 ..] (B.unpack bs))
+        pokeComponents p (off + B.length bs) xs
 
 putDouble :: Double -> ByteString
 putDouble d

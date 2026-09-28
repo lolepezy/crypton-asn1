@@ -30,6 +30,7 @@ ghc-options:
 - -Wall
 
 other-extensions:
+- BangPatterns
 - CPP
 - RankNTypes
 - ViewPatterns
