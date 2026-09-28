@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## Unreleased
+
+* Decode and encode several times faster, allocating far less, with the same
+  results as before (including for malformed input, and when and what a
+  decoded list throws):
+  * a stream is decoded straight from a strict bytestring: its structure is
+    checked in one pass, then values are produced as they are asked for,
+    without the intermediate list of events;
+  * `encodeASN1 DER` and `toByteString` write straight into one buffer;
+  * integers, OIDs and the time forms DER requires are converted without
+    intermediate lists, and integers in time proportional to their size
+    rather than to its square.
+
 ## 0.10.0 - 2025-08-01
 
 * Depend on package `time-hourglass`, rather than `hourglass`. The fields of
