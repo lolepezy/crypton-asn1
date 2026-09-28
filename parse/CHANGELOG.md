@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## Unreleased
+
+* `onNextContainer` and `onNextContainerMaybe` no longer copy the items of the
+  container out of the stream: the parser reads them from the stream, up to
+  the `End` that closes the container. Results and errors are the same as
+  before.
+
 ## 0.10.0 - 2025-08-01
 
 * Depend indirectly on `time-hourglass`, rather than `hourglass`. The fields of
