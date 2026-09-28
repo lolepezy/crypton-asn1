@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to the
 [Haskell Package Versioning Policy](https://pvp.haskell.org/).
 
+## Unreleased
+
+* `getConstructedEnd` and `getConstructedEndRepr` allocate far less: the
+  values up to the corresponding `End`, and those after it, are now two plain
+  traversals of the list rather than a lazy pair per value. They are as lazy
+  as before.
+
 ## 0.4.1 - 2025-08-02
 
 * `Data.ASN1.Types` re-exports all of `Data.ASN1.OID`.
